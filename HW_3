@@ -1,0 +1,162 @@
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+import gymnasium as gym
+import random
+import sys
+from collections import deque, namedtuple, defaultdict
+from scipy.special import softmax
+import pandas as pd
+from IPython.display import clear_output
+
+class QLearningAgent:
+    def __init__(self, alpha, epsilon, discount, env):
+        """
+        Q-Learning Agent
+        based on https://inst.eecs.berkeley.edu/~cs188/sp19/projects.html
+        Instance variables you have access to
+          - self.epsilon (exploration prob)
+          - self.alpha (learning rate)
+          - self.discount (discount rate aka gamma)
+
+        Functions you should use
+          - self.get_legal_actions(state) {state, hashable -> list of actions, each is hashable}
+            which returns legal actions for a state
+          - self.get_qvalue(state,action)
+            which returns Q(state,action)
+          - self.set_qvalue(state,action,value)
+            which sets Q(state,action) := value
+        !!!Important!!!
+        Note: please avoid using self._qValues directly.
+            There's a special self.get_qvalue/set_qvalue for that.
+        """
+
+        self.env = env
+        self._qvalues = defaultdict(lambda: defaultdict(lambda: 0))
+        self.alpha = alpha
+        self.epsilon = epsilon
+        self.discount = discount
+
+    def get_legal_actions(self, _state):
+        return list(range(self.env.action_space.n))
+
+    def get_qvalue(self, state, action):
+        """Returns Q(state,action)"""
+        return self._qvalues[state][action]
+
+    def set_qvalue(self, state, action, value):
+        """Sets the Qvalue for [state,action] to the given value"""
+        self._qvalues[state][action] = value
+
+class SoftmaxEVSarsaAgent(EVSarsaAgent):
+    def get_value(self, state):
+        possible_actions = self.get_legal_actions(state)
+        if len(possible_actions) == 0:
+            return 0.0
+
+        q_values = [self.get_qvalue(state, a) for a in possible_actions]
+        probs = softmax(np.array(q_values) / self.tau)
+        value = float(np.sum(probs * np.array(q_values)))
+        return value
+
+    def get_action(self, state):
+        possible_actions = self.get_legal_actions(state)
+        if len(possible_actions) == 0:
+            return None
+
+        q_values = [self.get_qvalue(state, a) for a in possible_actions]
+        probs = softmax(np.array(q_values) / self.tau)
+        
+        rand = self.env.np_random.random()
+        cum_sum = 0.0
+        for a, p in zip(possible_actions, probs):
+            cum_sum += p
+            if rand < cum_sum:
+                return a
+        return possible_actions[-1]
+
+class ReplayBuffer(object):
+    def __init__(self, size):
+        self._storage = []
+        self._maxsize = size
+
+    def __len__(self):
+        return len(self._storage)
+
+    def add(self, obs_t, action, reward, obs_tp1, done):
+        if len(self._storage) >= self._maxsize:
+            self._storage.pop(0)
+        self._storage.append((obs_t, action, reward, obs_tp1, done))
+
+    def sample(self, batch_size):
+        idxes = [random.randint(0, len(self._storage) - 1) for _ in range(batch_size)]
+        samples = [self._storage[i] for i in idxes]
+        
+        return (
+            np.array([s[0] for s in samples]),
+            np.array([s[1] for s in samples]),
+            np.array([s[2] for s in samples]),
+            np.array([s[3] for s in samples]),
+            np.array([s[4] for s in samples])
+        )
+
+class NStepEVSarsaAgent(EVSarsaAgent):
+    def update(self, state, action, reward, next_state, done):
+        if len(self.memory) == 0:
+            self.memory.append(Transition(state, action, reward, next_state, done))
+            return
+
+        if self.t < self.T:
+            self.memory.append(Transition(state, action, reward, next_state, done))
+            if done:
+                self.T = self.t + 1
+
+        tau = self.t - self.n_steps
+        if tau >= 0:
+            G = 0
+            for idx in reversed(range(tau, min(tau + self.n_steps, self.T))):
+                G = self.memory[idx].reward + self.discount * G
+
+            if tau + self.n_steps < self.T:
+                next_s = self.memory[tau + self.n_steps].next_state
+                if next_s is not None:
+                    G = G + (self.discount ** self.n_steps) * self.get_value(next_s)
+
+            state_tau, action_tau = self.memory[tau].state, self.memory[tau].action
+            current_q = self.get_qvalue(state_tau, action_tau)
+            new_qvalue = current_q + self.alpha * (G - current_q)
+            self.set_qvalue(state_tau, action_tau, new_qvalue)
+            
+        self.t += 1
+
+class QLambdaAgent(QLearningAgent):
+    def update(self, state, action, reward, next_state, _done):
+        for s, a in list(self.eligibility_trace.keys()):
+            if action == self.get_best_action(state):
+                self.eligibility_trace[(s, a)] *= self.discount * self.lambda_factor
+            else:
+                self.eligibility_trace[(s, a)] = 0
+            if abs(self.eligibility_trace[(s, a)]) < 1e-6:
+                del self.eligibility_trace[(s, a)]
+
+        next_value = self.get_value(next_state) if next_state is not None else 0
+        delta = reward + self.discount * next_value - self.get_qvalue(state, action)
+
+        self.eligibility_trace[(state, action)] += 1.0
+
+        for s, a in list(self.eligibility_trace.keys()):
+            new_qvalue = self.get_qvalue(s, a) + self.alpha * delta * self.eligibility_trace[(s, a)]
+            self.set_qvalue(s, a, new_qvalue)
+
+class RetraceAgent(QLearningAgent):
+    def get_action_probability(self, state, action):
+        possible_actions = self.get_legal_actions(state)
+        n_actions = len(possible_actions)
+        if n_actions == 0:
+            return 0.0
+            
+        best_action = self.get_best_action(state)
+        prob = self.epsilon / n_actions
+        if action == best_action:
+            prob += 1.0 - self.epsilon
+        return prob
