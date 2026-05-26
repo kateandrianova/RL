@@ -1,0 +1,295 @@
+import gymnasium as gym
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import torch
+from torch import nn
+from time import sleep
+from tqdm import tqdm
+from IPython.display import clear_output
+from q_learning_agent import QLearningAgent
+from replay_buffer import ReplayBuffer
+
+class YourAgent:
+    def __init__(self, n_actions=5, nu=0.95):
+        self.n_actions = n_actions
+        self.nu = nu  # Фактор забывания старой информации
+        self.reset()
+
+    def reset(self):
+        # Инициализируем априорные параметры Бета-распределения
+        self._successes = np.ones(self.n_actions)
+        self._failures = np.ones(self.n_actions)
+
+    def get_action(self):
+        # Сэмплируем вероятности из Бета-распределения для каждого действия
+        samples = np.random.beta(self._successes, self._failures)
+        return np.argmax(samples)
+
+    def update(self, action, reward):
+        # Экспоненциально сглаживаем прошлую статистику для всех действий,
+        # чтобы агент адаптировался к дрейфу среды
+        self._successes *= self.nu
+        self._failures *= self.nu
+        
+        # Добавляем базовое априорное значение, чтобы параметры не уходили в 0
+        self._successes += (1.0 - self.nu)
+        self._failures += (1.0 - self.nu)
+
+        # Добавляем новое наблюдение
+        if reward == 1:
+            self._successes[action] += 1.0
+        else:
+            self._failures[action] += 1.0
+
+drifting_agents = [
+    ThompsonSamplingAgent(),
+    EpsilonGreedyAgent(),
+    UCBAgent(),
+    YourAgent()
+]
+
+class BaseIntrinsicRewardModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def get_intrinsic_reward(self, state, action, next_state):
+        return 0.0
+
+    def get_loss(self, state_batch, action_batch, next_state_batch):
+        pass
+
+# Помощники для среды Deep Sea
+def get_state_number(s):
+    return np.argmax(s.flatten())
+
+def to_one_hot(x, ndims):
+    x = x.long().view(-1, 1)
+    x = torch.zeros(x.size()[0], ndims).scatter_(1, x, 1)
+    return x
+
+def get_all_states_value(agent):
+    s_shape = env.observation_space.shape
+    s_shape_flatten = np.prod(s_shape)
+    v = np.zeros(s_shape_flatten)
+    for i in range(s_shape_flatten):
+        v[i] = agent.get_value(i)
+    v = v.reshape(s_shape)
+    return v
+
+def train_with_reward(env, agent, reward_module, n_episodes=100, update_reward_period=100, batch_size=100, n_iter=10):
+    buffer = ReplayBuffer(size=int(1e6))
+    
+    if list(reward_module.parameters()):
+        optimizer = torch.optim.Adam(reward_module.parameters())
+    else:
+        optimizer = None
+
+    losses = []
+    s, _ = env.reset()
+
+    for i in range(n_episodes):
+        done = False
+        while not done:
+            i_s = get_state_number(s)
+            a = agent.get_action(i_s)
+            s_next, r, terminated, truncated, _  = env.step(a)
+            done = terminated or truncated
+            i_s_next = get_state_number(s_next)
+            
+            state_t = torch.tensor(s).float().view(1, -1)
+            action_t = torch.tensor(a).float().view(1, -1)
+            next_state_t = torch.tensor(s_next).float().view(1, -1)
+
+            r_intr = reward_module.get_intrinsic_reward(state_t, action_t, next_state_t)
+            r += r_intr
+
+            agent.update(i_s, a, r, i_s_next, terminated)
+            buffer.add(s, a, r, s_next, terminated)
+            s = s_next
+
+        if (i + 1) % update_reward_period == 0 and optimizer is not None:
+            for _ in range(n_iter):
+                optimizer.zero_grad()
+                state_batch, action_batch, _, next_state_batch, _ = buffer.sample(batch_size)
+                
+                state_tensor = torch.tensor(state_batch).float().flatten(1, 2)
+                action_tensor = torch.tensor(action_batch).float().view(-1, 1)
+                next_state_tensor = torch.tensor(next_state_batch).float().flatten(1, 2)
+                
+                loss = reward_module.get_loss(state_tensor, action_tensor, next_state_tensor)
+                loss.backward()
+                optimizer.step()
+                losses.append(loss.item())
+           
+            fig, ax = plt.subplots(ncols=2)
+            ax[0].set_title('Value function after iter: %d' % i)
+            im = ax[0].imshow(get_all_states_value(agent))
+            ax[1].plot(losses)
+            ax[1].set_title('Random network distillation loss')
+            clear_output(True)
+            plt.show()
+
+class MLP(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_size)
+        )
+        
+        def init_weights(tensor):
+            if isinstance(tensor, nn.Linear):
+                nn.init.xavier_uniform_(tensor.weight)
+        
+        self.layers.apply(init_weights)
+               
+    def forward(self, x):
+        return self.layers(x)
+
+class GoRightReward(BaseIntrinsicRewardModule):
+    def __init__(self):
+        super().__init__()
+
+    def get_intrinsic_reward(self, state, action, next_state):
+        if action.item() == 1:
+            return 0.1
+        return 0.0
+
+
+class ForwardDynamics(BaseIntrinsicRewardModule):
+    def __init__(self, states_size, actions_size, hidden_size, alpha=.1):
+        super().__init__()
+        self.module = MLP(
+            actions_size + states_size,
+            hidden_size,
+            states_size
+        )
+        self.alpha = alpha
+        self.mean_reward = 0
+    
+    def forward(self, s, a):
+        sa = torch.cat([s, a], dim=-1)
+        return s + self.module(sa)
+
+def get_intrinsic_reward(self, state, action, next_state):
+        with torch.no_grad():
+            predicted_next_state = self.forward(state, action)
+            r = torch.mean((predicted_next_state - next_state) ** 2).item()
+      
+            r_centered = r - self.mean_reward
+            self.mean_reward = self.alpha * (r) + (1 - self.alpha) * self.mean_reward
+            return r_centered
+
+    def get_loss(self, state_batch, action_batch, next_state_batch):
+        predicted_next_states = self.forward(state_batch, action_batch)
+        return torch.mean((predicted_next_states - next_state_batch) ** 2)
+
+class InverseDynamics(BaseIntrinsicRewardModule):
+    def __init__(self, states_size, n_actions, hidden_size, alpha=0.1):
+        super().__init__()
+        self.module = MLP(
+            2 * states_size,
+            hidden_size,
+            n_actions
+        )
+        self.alpha = alpha
+        self.mean_reward = 0
+        self.n_actions = n_actions
+    
+    def forward(self, s, s_next):
+        ss_next = torch.cat([s, s_next], dim=-1)
+        logits = self.module(ss_next)
+        return torch.softmax(logits, dim=-1)
+    
+    def get_intrinsic_reward(self, state, action, next_state):
+        with torch.no_grad():
+            a_pred_proba = self.forward(state, next_state)
+            act_idx = action.long().item()
+            r = -torch.log(a_pred_proba[0, act_idx] + 1e-8).item()
+            
+            r_centered = r - self.mean_reward
+            self.mean_reward = self.alpha * (r) + (1 - self.alpha) * self.mean_reward
+            return r_centered
+
+    def get_loss(self, state_batch, action_batch, next_state_batch):        
+        a_pred_proba = self.forward(state_batch, next_state_batch)
+        a_one_hot = to_one_hot(action_batch, self.n_actions)
+        return -(torch.log(a_pred_proba + 1e-8) * a_one_hot).sum(dim=-1).mean()
+
+class Embedder(nn.Module):
+    def __init__(self, states_size, embedding_size, hidden_size):
+        super().__init__()
+        self.module = MLP(states_size, hidden_size, embedding_size)
+        
+    def forward(self, s):
+        return self.module(s)
+        
+class ICMModule(BaseIntrinsicRewardModule):
+    def __init__(self, states_size, n_actions, hidden_size, embedding_size, alpha=0.1):
+        super().__init__()
+        self.alpha = alpha
+        self.mean_reward = 0
+        self.n_actions = n_actions
+        
+        self.embedder = Embedder(states_size, embedding_size, hidden_size)
+        self.inverse_net = MLP(2 * embedding_size, hidden_size, n_actions)
+        self.forward_net = MLP(embedding_size + 1, hidden_size, embedding_size)
+    
+    def get_intrinsic_reward(self, state, action, next_state):
+        with torch.no_grad():            
+            phi_s = self.embedder(state)
+            phi_s_next = self.embedder(next_state)
+            
+            forward_input = torch.cat([phi_s, action], dim=-1)
+            predicted_phi_s_next = phi_s + self.forward_net(forward_input)
+            
+            r = torch.mean((predicted_phi_s_next - phi_s_next) ** 2).item()
+            
+            r_centered = r - self.mean_reward
+            self.mean_reward = self.alpha * (r) + (1 - self.alpha) * self.mean_reward
+            return r_centered
+
+    def get_loss(self, state_batch, action_batch, next_state_batch):
+        phi_s = self.embedder(state_batch)
+        phi_s_next = self.embedder(next_state_batch)
+        
+        inverse_input = torch.cat([phi_s, phi_s_next], dim=-1)
+        action_logits = self.inverse_net(inverse_input)
+        
+        target_actions = action_batch.squeeze(-1).long()
+        loss_inv = nn.functional.cross_entropy(action_logits, target_actions)
+        
+        forward_input = torch.cat([phi_s, action_batch], dim=-1)
+        predicted_phi_s_next = phi_s + self.forward_net(forward_input)
+        loss_fwd = torch.mean((predicted_phi_s_next - phi_s_next.detach()) ** 2)
+        
+        return loss_inv + loss_fwd
+
+class RandomNetworkDistilationModule(BaseIntrinsicRewardModule):
+    def __init__(self, input_size, output_size, hidden_size, alpha=0.1):
+        super().__init__()
+        self.alpha = alpha
+        self.mean_reward = 0
+        
+        self.target_net = MLP(input_size, hidden_size, output_size)
+        for param in self.target_net.parameters():
+            param.requires_grad = False
+            
+        self.predictor_net = MLP(input_size, hidden_size, output_size)
+
+    def get_intrinsic_reward(self, state, action, next_state):
+        with torch.no_grad():
+            target_out = self.target_net(next_state)
+            predictor_out = self.predictor_net(next_state)
+            r = torch.mean((predictor_out - target_out) ** 2).item()
+            
+            r_centered = r - self.mean_reward
+            self.mean_reward = self.alpha * (r) + (1 - self.alpha) * self.mean_reward
+            return r_centered
+
+    def get_loss(self, state_batch, action_batch, next_state_batch):
+        target_out = self.target_net(next_state_batch)
+        predictor_out = self.predictor_net(next_state_batch)
+        return torch.mean((predictor_out - target_out) ** 2)
