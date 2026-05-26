@@ -1,0 +1,49 @@
+import torch
+import torch.nn as nn
+
+class ConvBackbone(nn.Module):
+    def __init__(self, c_in=4):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(c_in, 32, kernel_size=8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
+            nn.Flatten()
+        )
+    def forward(self, x): return self.conv(x)
+
+class DuelingDqnHead(nn.Module):
+    def __init__(self, n_actions, inp_size=3136): # 64*7*7
+        super().__init__()
+        self.adv = nn.Sequential(nn.Linear(inp_size, 512), nn.ReLU(), nn.Linear(512, n_actions))
+        self.val = nn.Sequential(nn.Linear(inp_size, 512), nn.ReLU(), nn.Linear(512, 1))
+    def forward(self, x):
+        adv = self.adv(x)
+        val = self.val(x)
+        return val + (adv - adv.mean(dim=1, keepdim=True))
+
+def compute_td_loss_on_tensors_double(states, actions, rewards, next_states, is_done, agent, target_network, gamma=0.99):
+    # Предсказания основной сети
+    predicted_qvalues = agent(states)
+    predicted_qvalues_for_actions = predicted_qvalues[range(len(actions)), actions]
+
+    with torch.no_grad():
+        # Double DQN: Выбор лучшего действия по основной сети, оценка по целевой
+        next_actions = agent(next_states).argmax(dim=1)
+        next_qvalues_target = target_network(next_states)
+        next_state_values = next_qvalues_target[range(len(next_states)), next_actions]
+        
+    target_qvalues_for_actions = rewards + gamma * next_state_values * (1 - is_done.float())
+    return torch.mean((predicted_qvalues_for_actions - target_qvalues_for_actions.detach()) ** 2)
+
+def play_and_record(initial_state, action_sampler, env, exp_replay, n_steps=1):
+    s = initial_state
+    sum_rewards = 0
+    for _ in range(n_steps):
+        action = action_sampler(s)
+        next_s, r, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+        exp_replay.add(s, action, r, next_s, done)
+        sum_rewards += r
+        s = env.reset()[0] if done else next_s
+    return sum_rewards, s
